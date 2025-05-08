@@ -303,7 +303,8 @@ async def update_image_config(
     set_image_model(request, form_data.MODEL)
 
     pattern = r"^\d+x\d+$"
-    if re.match(pattern, form_data.IMAGE_SIZE):
+
+    if re.match(pattern, form_data.IMAGE_SIZE) or form_data.IMAGE_SIZE == "auto":
         request.app.state.config.IMAGE_SIZE = form_data.IMAGE_SIZE
     else:
         raise HTTPException(
@@ -470,7 +471,8 @@ async def image_generations(
     form_data: GenerateImageForm,
     user=Depends(get_verified_user),
 ):
-    width, height = tuple(map(int, request.app.state.config.IMAGE_SIZE.split("x")))
+    # support for OPENAI auto format for gpt-image-1
+    width, height = tuple(map(int, request.app.state.config.IMAGE_SIZE.split("x"))) if request.app.state.config.IMAGE_SIZE != "auto" else (0, 0)  
 
     r = None
     try:
@@ -500,7 +502,11 @@ async def image_generations(
                     if form_data.size
                     else request.app.state.config.IMAGE_SIZE
                 ),
-                "response_format": "b64_json",
+                **(
+                    {}
+                    if "gpt-image-1" in request.app.state.config.IMAGE_GENERATION_MODEL
+                    else {"response_format": "b64_json"}
+                ),
             }
 
             # Use asyncio.to_thread for the requests.post call
@@ -619,7 +625,7 @@ async def image_generations(
             or request.app.state.config.IMAGE_GENERATION_ENGINE == ""
         ):
             if form_data.model:
-                set_image_model(form_data.model)
+                set_image_model(request, form_data.model)
 
             data = {
                 "prompt": form_data.prompt,
