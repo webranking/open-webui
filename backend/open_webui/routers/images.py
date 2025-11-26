@@ -10,16 +10,21 @@ from typing import Optional
 
 from urllib.parse import quote
 import requests
+from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
 from open_webui.config import CACHE_DIR
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import ENABLE_FORWARD_USER_INFO_HEADERS, SRC_LOG_LEVELS
-from open_webui.routers.files import upload_file
+from open_webui.routers.files import upload_file, get_file_content_by_id
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.images.comfyui import (
     ComfyUIGenerateImageForm,
+    ComfyUIEditImageForm,
     ComfyUIWorkflow,
     comfyui_generate_image,
+    comfyui_upload_image,
+    comfyui_edit_image,
 )
 from pydantic import BaseModel
 
@@ -424,6 +429,14 @@ class GenerateImageForm(BaseModel):
     n: int = 1
     negative_prompt: Optional[str] = None
 
+CreateImageForm = GenerateImageForm
+
+
+def get_image_data(data: str, headers=None):
+    if data.startswith("http://") or data.startswith("https://"):
+        return load_url_image_data(data, headers)
+    return load_b64_image_data(data)
+
 
 def load_b64_image_data(b64_str):
     try:
@@ -688,4 +701,291 @@ async def image_generations(
             data = r.json()
             if "error" in data:
                 error = data["error"]["message"]
+        raise HTTPException(status_code=400, detail=ERROR_MESSAGES.DEFAULT(error))
+
+
+class EditImageForm(BaseModel):
+    image: str | list[str]
+    prompt: str
+    model: Optional[str] = None
+    size: Optional[str] = None
+    n: Optional[int] = None
+    negative_prompt: Optional[str] = None
+
+
+@router.post("/edit")
+async def image_edits(
+    request: Request,
+    form_data: EditImageForm,
+    user=Depends(get_verified_user),
+):
+    size = None
+    width, height = None, None
+    if (
+        request.app.state.config.IMAGE_EDIT_SIZE
+        and "x" in request.app.state.config.IMAGE_EDIT_SIZE
+    ) or (form_data.size and "x" in form_data.size):
+        size = (
+            form_data.size
+            if form_data.size
+            else request.app.state.config.IMAGE_EDIT_SIZE
+        )
+        width, height = tuple(map(int, size.split("x")))
+
+    model = (
+        request.app.state.config.IMAGE_EDIT_MODEL
+        if form_data.model is None
+        else form_data.model
+    )
+
+    try:
+
+        async def load_url_image(data):
+            if data.startswith("http://") or data.startswith("https://"):
+                r = await asyncio.to_thread(requests.get, data)
+                r.raise_for_status()
+
+                image_data = base64.b64encode(r.content).decode("utf-8")
+                return f"data:{r.headers['content-type']};base64,{image_data}"
+
+            elif data.startswith("/api/v1/files"):
+                file_id = data.split("/api/v1/files/")[1].split("/content")[0]
+                file_response = await get_file_content_by_id(file_id, user)
+
+                if isinstance(file_response, FileResponse):
+                    file_path = file_response.path
+
+                    with open(file_path, "rb") as f:
+                        file_bytes = f.read()
+                        image_data = base64.b64encode(file_bytes).decode("utf-8")
+                        mime_type, _ = mimetypes.guess_type(file_path)
+
+                    return f"data:{mime_type};base64,{image_data}"
+
+            return data
+
+        if isinstance(form_data.image, str):
+            form_data.image = await load_url_image(form_data.image)
+        elif isinstance(form_data.image, list):
+            form_data.image = [await load_url_image(img) for img in form_data.image]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=ERROR_MESSAGES.DEFAULT(e))
+
+    def get_image_file_item(base64_string, param_name="image"):
+        data = base64_string
+        header, encoded = data.split(",", 1)
+        mime_type = header.split(";")[0].lstrip("data:")
+        image_data = base64.b64decode(encoded)
+        return (
+            param_name,
+            (
+                f"{uuid4()}.png",
+                io.BytesIO(image_data),
+                mime_type if mime_type else "image/png",
+            ),
+        )
+
+    r = None
+    try:
+        if request.app.state.config.IMAGE_EDIT_ENGINE == "openai":
+            headers = {
+                "Authorization": f"Bearer {request.app.state.config.IMAGES_EDIT_OPENAI_API_KEY}",
+            }
+
+            if ENABLE_FORWARD_USER_INFO_HEADERS:
+                headers["X-OpenWebUI-User-Name"] = quote(user.name, safe=" ")
+                headers["X-OpenWebUI-User-Id"] = user.id
+                headers["X-OpenWebUI-User-Email"] = user.email
+                headers["X-OpenWebUI-User-Role"] = user.role
+
+            data = {
+                "model": model,
+                "prompt": form_data.prompt,
+                **({"n": form_data.n} if form_data.n else {}),
+                **({"size": size} if size else {}),
+                **(
+                    {}
+                    if "gpt-image-1" in request.app.state.config.IMAGE_EDIT_MODEL
+                    else {"response_format": "b64_json"}
+                ),
+            }
+
+            files = []
+            if isinstance(form_data.image, str):
+                files = [get_image_file_item(form_data.image)]
+            elif isinstance(form_data.image, list):
+                for img in form_data.image:
+                    files.append(get_image_file_item(img, "image[]"))
+
+            url_search_params = ""
+            if request.app.state.config.IMAGES_EDIT_OPENAI_API_VERSION:
+                url_search_params += f"?api-version={request.app.state.config.IMAGES_EDIT_OPENAI_API_VERSION}"
+
+            r = await asyncio.to_thread(
+                requests.post,
+                url=f"{request.app.state.config.IMAGES_EDIT_OPENAI_API_BASE_URL}/images/edits{url_search_params}",
+                headers=headers,
+                files=files,
+                data=data,
+            )
+
+            r.raise_for_status()
+            res = r.json()
+
+            images = []
+            for image in res["data"]:
+                if image_url := image.get("url", None):
+                    image_data, content_type = get_image_data(image_url, headers)
+                else:
+                    image_data, content_type = get_image_data(image["b64_json"])
+
+                url = upload_image(request, image_data, content_type, data, user)
+                images.append({"url": url})
+            return images
+
+        elif request.app.state.config.IMAGE_EDIT_ENGINE == "gemini":
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": request.app.state.config.IMAGES_EDIT_GEMINI_API_KEY,
+            }
+
+            model = f"{model}:generateContent"
+            data = {"contents": [{"parts": [{"text": form_data.prompt}]}]}
+
+            if isinstance(form_data.image, str):
+                data["contents"][0]["parts"].append(
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": form_data.image.split(",", 1)[1],
+                        }
+                    }
+                )
+            elif isinstance(form_data.image, list):
+                data["contents"][0]["parts"].extend(
+                    [
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": image.split(",", 1)[1],
+                            }
+                        }
+                        for image in form_data.image
+                    ]
+                )
+
+            r = await asyncio.to_thread(
+                requests.post,
+                url=f"{request.app.state.config.IMAGES_EDIT_GEMINI_API_BASE_URL}/models/{model}",
+                json=data,
+                headers=headers,
+            )
+
+            r.raise_for_status()
+            res = r.json()
+
+            images = []
+            for image in res["candidates"]:
+                for part in image["content"]["parts"]:
+                    if part.get("inlineData", {}).get("data"):
+                        image_data, content_type = get_image_data(
+                            part["inlineData"]["data"]
+                        )
+                        url = upload_image(
+                            request, image_data, content_type, data, user
+                        )
+                        images.append({"url": url})
+
+            return images
+
+        elif request.app.state.config.IMAGE_EDIT_ENGINE == "comfyui":
+            try:
+                files = []
+                if isinstance(form_data.image, str):
+                    files = [get_image_file_item(form_data.image)]
+                elif isinstance(form_data.image, list):
+                    for img in form_data.image:
+                        files.append(get_image_file_item(img))
+
+                comfyui_images = []
+                for file_item in files:
+                    res = await comfyui_upload_image(
+                        file_item,
+                        request.app.state.config.IMAGES_EDIT_COMFYUI_BASE_URL,
+                        request.app.state.config.IMAGES_EDIT_COMFYUI_API_KEY,
+                    )
+                    comfyui_images.append(res.get("name", file_item[1][0]))
+            except Exception as e:
+                log.debug(f"Error uploading images to ComfyUI: {e}")
+                raise Exception("Failed to upload images to ComfyUI.")
+
+            data = {
+                "image": comfyui_images,
+                "prompt": form_data.prompt,
+                **({"width": width} if width is not None else {}),
+                **({"height": height} if height is not None else {}),
+                **({"n": form_data.n} if form_data.n else {}),
+            }
+
+            form_data = ComfyUIEditImageForm(
+                **{
+                    "workflow": ComfyUIWorkflow(
+                        **{
+                            "workflow": request.app.state.config.IMAGES_EDIT_COMFYUI_WORKFLOW,
+                            "nodes": request.app.state.config.IMAGES_EDIT_COMFYUI_WORKFLOW_NODES,
+                        }
+                    ),
+                    **data,
+                }
+            )
+            res = await comfyui_edit_image(
+                model,
+                form_data,
+                user.id,
+                request.app.state.config.IMAGES_EDIT_COMFYUI_BASE_URL,
+                request.app.state.config.IMAGES_EDIT_COMFYUI_API_KEY,
+            )
+            log.debug(f"res: {res}")
+
+            image_urls = set()
+            for image in res["data"]:
+                image_urls.add(image["url"])
+            image_urls = list(image_urls)
+
+            output_type_urls = [url for url in image_urls if "type=output" in url]
+            if output_type_urls:
+                image_urls = output_type_urls
+
+            log.debug(f"Image URLs: {image_urls}")
+            images = []
+
+            for image_url in image_urls:
+                headers = None
+                if request.app.state.config.IMAGES_EDIT_COMFYUI_API_KEY:
+                    headers = {
+                        "Authorization": f"Bearer {request.app.state.config.IMAGES_EDIT_COMFYUI_API_KEY}"
+                    }
+
+                image_data, content_type = get_image_data(image_url, headers)
+                url = upload_image(
+                    request,
+                    image_data,
+                    content_type,
+                    form_data.model_dump(exclude_none=True),
+                    user,
+                )
+                images.append({"url": url})
+
+            return images
+    except Exception as e:
+        error = e
+        if r != None:
+            data = r.text
+            try:
+                data = json.loads(data)
+                if "error" in data:
+                    error = data["error"]["message"]
+            except Exception:
+                error = data
+
         raise HTTPException(status_code=400, detail=ERROR_MESSAGES.DEFAULT(error))
