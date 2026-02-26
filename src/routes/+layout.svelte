@@ -28,7 +28,9 @@
 		isApp,
 		appInfo,
 		toolServers,
-		playingNotificationSound
+		playingNotificationSound,
+		channels,
+		channelId
 	} from '$lib/stores';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
@@ -52,9 +54,11 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
+	import SyncStatsModal from '$lib/components/chat/Settings/SyncStatsModal.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { getUserSettings } from '$lib/apis/users';
 	import dayjs from 'dayjs';
+	import { getChannels } from '$lib/apis/channels';
 
 	const unregisterServiceWorkers = async () => {
 		if ('serviceWorker' in navigator) {
@@ -86,6 +90,11 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 	let tokenTimer = null;
 
 	let showRefresh = false;
+
+	let showSyncStatsModal = false;
+	let syncStatsEventData = null;
+
+	let heartbeatInterval = null;
 
 	const BREAKPOINT = 768;
 
@@ -123,6 +132,14 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 				}
 			}
 
+			// Send heartbeat every 30 seconds
+			heartbeatInterval = setInterval(() => {
+				if (_socket.connected) {
+					console.log('Sending heartbeat');
+					_socket.emit('heartbeat', {});
+				}
+			}, 30000);
+
 			if (deploymentId !== null) {
 				WEBUI_DEPLOYMENT_ID.set(deploymentId);
 			}
@@ -151,6 +168,12 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 
 		_socket.on('disconnect', (reason, details) => {
 			console.log(`Socket ${_socket.id} disconnected due to ${reason}`);
+
+			if (heartbeatInterval) {
+				clearInterval(heartbeatInterval);
+				heartbeatInterval = null;
+			}
+
 			if (details) {
 				console.log('Additional details:', details);
 			}
@@ -306,6 +329,14 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 	const chatEventHandler = async (event, cb) => {
 		const chat = $page.url.pathname.includes(`/c/${event.chat_id}`);
 
+		// Skip events from temporary chats that are not the current chat.
+		// This prevents notifications from being sent to other tabs/devices
+		// for privacy, since temporary chats are not meant to be persisted or visible elsewhere.
+		const isTemporaryChat = event.chat_id?.startsWith('local:');
+		if (isTemporaryChat && event.chat_id !== $chatId) {
+			return;
+		}
+
 		let isFocused = document.visibilityState !== 'visible';
 		if (window.electronAPI) {
 			const res = await window.electronAPI.send({
@@ -323,6 +354,7 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isFocused) {
 			if (type === 'chat:completion') {
 				const { done, content, title } = data;
+				const displayTitle = title || $i18n.t('New Chat');
 
 				if (done) {
 					if ($settings?.notificationSoundAlways ?? false) {
@@ -337,7 +369,7 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 
 					if ($isLastActiveTab) {
 						if ($settings?.notificationEnabled ?? false) {
-							new Notification(`${title} • Open WebUI`, {
+							new Notification(`${displayTitle} • Open WebUI`, {
 								body: content,
 								icon: `${WEBUI_BASE_URL}/static/favicon.png`
 							});
@@ -350,7 +382,7 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 								goto(`/c/${event.chat_id}`);
 							},
 							content: content,
-							title: title
+							title: displayTitle
 						},
 						duration: 15000,
 						unstyled: true
@@ -461,7 +493,26 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 	};
 
 	const channelEventHandler = async (event) => {
+		console.log('channelEventHandler', event);
 		if (event.data?.type === 'typing') {
+			return;
+		}
+
+		// handle channel created event
+		if (event.data?.type === 'channel:created') {
+			const res = await getChannels(localStorage.token).catch(async (error) => {
+				return null;
+			});
+
+			if (res) {
+				await channels.set(
+					res.sort(
+						(a, b) =>
+							['', null, 'group', 'dm'].indexOf(a.type) - ['', null, 'group', 'dm'].indexOf(b.type)
+					)
+				);
+			}
+
 			return;
 		}
 
@@ -483,10 +534,45 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 			const type = event?.data?.type ?? null;
 			const data = event?.data?.data ?? null;
 
+			if ($channels) {
+				if ($channels.find((ch) => ch.id === event.channel_id) && $channelId !== event.channel_id) {
+					channels.set(
+						$channels.map((ch) => {
+							if (ch.id === event.channel_id) {
+								if (type === 'message') {
+									return {
+										...ch,
+										unread_count: (ch.unread_count ?? 0) + 1,
+										last_message_at: event.created_at
+									};
+								}
+							}
+							return ch;
+						})
+					);
+				} else {
+					const res = await getChannels(localStorage.token).catch(async (error) => {
+						return null;
+					});
+
+					if (res) {
+						await channels.set(
+							res.sort(
+								(a, b) =>
+									['', null, 'group', 'dm'].indexOf(a.type) -
+									['', null, 'group', 'dm'].indexOf(b.type)
+							)
+						);
+					}
+				}
+			}
+
 			if (type === 'message') {
+				const title = `${data?.user?.name}${event?.channel?.type !== 'dm' ? ` (#${event?.channel?.name})` : ''}`;
+
 				if ($isLastActiveTab) {
 					if ($settings?.notificationEnabled ?? false) {
-						new Notification(`${data?.user?.name} (#${event?.channel?.name}) • Open WebUI`, {
+						new Notification(`${title} • Open WebUI`, {
 							body: data?.content,
 							icon:
 								data?.user?.profile_image_url ??
@@ -495,17 +581,17 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 					}
 				}
 
-				toast.custom(NotificationToast, {
-					componentProps: {
-						onClick: () => {
-							goto(`/channels/${event.channel_id}`);
+					toast.custom(NotificationToast, {
+						componentProps: {
+							onClick: () => {
+								goto(`/channels/${event.channel_id}`);
+							},
+							content: data?.content,
+							title: `${title}`
 						},
-						content: data?.content,
-						title: event?.channel?.name
-					},
-					duration: 15000,
-					unstyled: true
-				});
+						duration: 15000,
+						unstyled: true
+					});
 			}
 		}
 	};
@@ -538,6 +624,21 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 		}
 	};
 
+	const windowMessageEventHandler = async (event) => {
+		if (
+			!['https://openwebui.com', 'https://www.openwebui.com', 'http://localhost:9999'].includes(
+				event.origin
+			)
+		) {
+			return;
+		}
+
+		if (event.data === 'export:stats' || event.data?.type === 'export:stats') {
+			syncStatsEventData = event.data;
+			showSyncStatsModal = true;
+		}
+	};
+
 	onMount(async () => {
 		const unsubscribeDataLayer = user.subscribe((value) => {
 			if (!value || typeof window === 'undefined') {
@@ -562,6 +663,8 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 			})(window, document, 'script', 'dataLayer', 'GTM-5CGLZH5J');
 		}
 
+		window.addEventListener('message', windowMessageEventHandler);
+
 		let touchstartY = 0;
 
 		function isNavOrDescendant(el) {
@@ -569,12 +672,12 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 			return nav && (el === nav || nav.contains(el));
 		}
 
-		document.addEventListener('touchstart', (e) => {
+		const touchstartHandler = (e) => {
 			if (!isNavOrDescendant(e.target)) return;
 			touchstartY = e.touches[0].clientY;
-		});
+		};
 
-		document.addEventListener('touchmove', (e) => {
+		const touchmoveHandler = (e) => {
 			if (!isNavOrDescendant(e.target)) return;
 			const touchY = e.touches[0].clientY;
 			const touchDiff = touchY - touchstartY;
@@ -582,15 +685,19 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 				showRefresh = true;
 				e.preventDefault();
 			}
-		});
+		};
 
-		document.addEventListener('touchend', (e) => {
+		const touchendHandler = (e) => {
 			if (!isNavOrDescendant(e.target)) return;
 			if (showRefresh) {
 				showRefresh = false;
 				location.reload();
 			}
-		});
+		};
+
+		document.addEventListener('touchstart', touchstartHandler);
+		document.addEventListener('touchmove', touchmoveHandler, { passive: false });
+		document.addEventListener('touchend', touchendHandler);
 
 		if (typeof window !== 'undefined') {
 			if (window.applyTheme) {
@@ -697,7 +804,7 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 			const browserLanguages = navigator.languages
 				? navigator.languages
 				: [navigator.language || navigator.userLanguage];
-			const lang = backendConfig.default_locale
+			const lang = backendConfig?.default_locale
 				? backendConfig.default_locale
 				: bestMatchingLanguage(languages, browserLanguages, 'en-US');
 			changeLanguage(lang);
@@ -724,7 +831,11 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 
 					if (sessionUser) {
 						await user.set(sessionUser);
-						await config.set(await getBackendConfig());
+						try {
+							await config.set(await getBackendConfig());
+						} catch (error) {
+							console.error('Error refreshing backend config:', error);
+						}
 					} else {
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
@@ -775,10 +886,28 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 			loaded = true;
 		}
 
+		// Auto-show SyncStatsModal when opened with ?sync=true (from community)
+		if (
+			(window.opener ?? false) &&
+			$page.url.searchParams.get('sync') === 'true' &&
+			($config?.features?.enable_community_sharing ?? false)
+		) {
+			showSyncStatsModal = true;
+		}
+
 		return () => {
 			window.removeEventListener('resize', onResize);
 			unsubscribeDataLayer();
+			window.removeEventListener('message', windowMessageEventHandler);
+			document.removeEventListener('touchstart', touchstartHandler);
+			document.removeEventListener('touchmove', touchmoveHandler);
+			document.removeEventListener('touchend', touchendHandler);
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
 		};
+	});
+
+	onDestroy(() => {
+		bc.close();
 	});
 </script>
 
@@ -815,6 +944,10 @@ import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME, APP_TITLE } from '$
 	{:else}
 		<slot />
 	{/if}
+{/if}
+
+{#if $config?.features.enable_community_sharing}
+	<SyncStatsModal bind:show={showSyncStatsModal} eventData={syncStatsEventData} />
 {/if}
 
 <Toaster

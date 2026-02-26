@@ -47,8 +47,8 @@
 	let key = '';
 	let headers = '';
 
-	let functionNameFilterList = [];
-	let accessControl = {};
+	let functionNameFilterList = '';
+	let accessGrants = [];
 
 	let id = '';
 	let name = '';
@@ -149,7 +149,7 @@
 				key,
 				config: {
 					enable: enable,
-					access_control: accessControl
+					access_grants: accessGrants
 				},
 				info: {
 					id,
@@ -206,7 +206,7 @@
 
 				if (data.config) {
 					enable = data.config.enable ?? true;
-					accessControl = data.config.access_control ?? {};
+					accessGrants = data.config.access_grants ?? [];
 				}
 
 				toast.success($i18n.t('Import successful'));
@@ -250,8 +250,12 @@
 	const submitHandler = async () => {
 		loading = true;
 
-		// remove trailing slash from url
-		url = url.replace(/\/$/, '');
+		// remove trailing slash from url for non-MCP connections
+		// MCP servers may require a trailing slash; stripping it can cause
+		// 301 redirects that lose auth headers (see #21179)
+		if (type !== 'mcp') {
+			url = url.replace(/\/$/, '');
+		}
 		if (id.includes(':') || id.includes('|')) {
 			toast.error($i18n.t('ID cannot contain ":" or "|" characters'));
 			loading = false;
@@ -305,7 +309,7 @@
 			config: {
 				enable: enable,
 				function_name_filter_list: functionNameFilterList,
-				access_control: accessControl
+				access_grants: accessGrants
 			},
 			info: {
 				id: id,
@@ -338,8 +342,8 @@
 		oauthClientInfo = null;
 
 		enable = true;
-		functionNameFilterList = [];
-		accessControl = null;
+		functionNameFilterList = '';
+		accessGrants = [];
 	};
 
 	const init = () => {
@@ -362,8 +366,8 @@
 			oauthClientInfo = connection.info?.oauth_client_info ?? null;
 
 			enable = connection.config?.enable ?? true;
-			functionNameFilterList = connection.config?.function_name_filter_list ?? [];
-			accessControl = connection.config?.access_control ?? null;
+			functionNameFilterList = connection.config?.function_name_filter_list ?? '';
+			accessGrants = connection.config?.access_grants ?? [];
 		}
 	};
 
@@ -486,7 +490,7 @@
 										className="shrink-0 flex items-center mr-1"
 									>
 										<button
-											class="self-center p-1 bg-transparent hover:bg-gray-100 dark:bg-gray-900 dark:hover:bg-gray-850 rounded-lg transition"
+											class="self-center p-1 bg-transparent hover:bg-gray-100 dark:hover:bg-gray-850 rounded-lg transition"
 											on:click={() => {
 												verifyHandler();
 											}}
@@ -534,7 +538,7 @@
 										<div class="flex-shrink-0 self-start">
 											<select
 												id="select-bearer-or-session"
-												class={`w-full text-sm bg-transparent pr-5 ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
+												class={`dark:bg-gray-900 w-full text-sm bg-transparent pr-5 ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
 												bind:value={spec_type}
 											>
 												<option value="url">{$i18n.t('URL')}</option>
@@ -644,7 +648,7 @@
 									<div class="flex-shrink-0 self-start">
 										<select
 											id="select-bearer-or-session"
-											class={`w-full text-sm bg-transparent pr-5 ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
+											class={`dark:bg-gray-900 w-full text-sm bg-transparent pr-5 ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
 											bind:value={auth_type}
 										>
 											<option value="none">{$i18n.t('None')}</option>
@@ -818,10 +822,8 @@
 
 							<hr class=" border-gray-100 dark:border-gray-700/10 my-2.5 w-full" />
 
-							<div class="my-2 -mx-2">
-								<div class="px-4 py-3 bg-gray-50 dark:bg-gray-950 rounded-3xl">
-									<AccessControl bind:accessControl />
-								</div>
+							<div class="my-2">
+								<AccessControl bind:accessGrants />
 							</div>
 						{/if}
 					</div>
