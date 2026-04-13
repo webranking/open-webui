@@ -33,17 +33,23 @@
 		currentChatPage,
 		temporaryChatEnabled,
 		mobile,
-		showOverview,
 		chatTitle,
 		showArtifacts,
 		artifactContents,
 		tools,
 		toolServers,
+		terminalServers,
 		functions,
 		selectedFolder,
 		pinnedChats,
-		showEmbeds
+		showEmbeds,
+		selectedTerminalId,
+		showFileNavPath,
+		showFileNavDir,
+		chatRequestQueues
 	} from '$lib/stores';
+
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
 	import {
 		convertMessagesToHistory,
@@ -53,11 +59,14 @@
 		getPromptVariables,
 		processDetails,
 		removeAllDetails,
-		getCodeBlockContents
+		getCodeBlockContents,
+		isYoutubeUrl,
+		displayFileHandler
 	} from '$lib/utils';
 	import { AudioQueue } from '$lib/utils/audio';
 
 	import {
+		archiveChatById,
 		createNewChat,
 		getAllTags,
 		getChatById,
@@ -91,21 +100,23 @@
 	import ChatControls from './ChatControls.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
 	import Placeholder from './Placeholder.svelte';
+	import FilesOverlay from './MessageInput/FilesOverlay.svelte';
 	import NotificationToast from '../NotificationToast.svelte';
 	import Spinner from '../common/Spinner.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
 	import Sidebar from '../icons/Sidebar.svelte';
 	import Image from '../common/Image.svelte';
+	import { getBanners } from '$lib/apis/configs';
 
 	export let chatIdProp = '';
 
 	let loading = true;
 
 	const eventTarget = new EventTarget();
-	let controlPane;
-	let controlPaneComponent;
+	let controlPane: Pane | undefined;
+	let controlPaneComponent: ChatControls | undefined;
 
-	let messageInput;
+	let messageInput: MessageInput | undefined;
 
 	let autoScroll = true;
 	let processing = '';
@@ -119,9 +130,8 @@
 	let eventConfirmationInput = false;
 	let eventConfirmationInputPlaceholder = '';
 	let eventConfirmationInputValue = '';
+	let eventConfirmationInputType = '';
 	let eventCallback = null;
-
-	let chatIdUnsubscriber: Unsubscriber | undefined;
 
 	let selectedModels = [''];
 	let atSelectedModel: Model | undefined;
@@ -134,6 +144,8 @@
 
 	let selectedToolIds = [];
 	let selectedFilterIds = [];
+	let pendingOAuthTools = [];
+
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
 	let codeInterpreterEnabled = false;
@@ -141,6 +153,7 @@
 	let showCommands = false;
 
 	let generating = false;
+	let dragged = false;
 	let generationController = null;
 
 	let chat = null;
@@ -185,6 +198,13 @@
 			window.setTimeout(() => scrollToBottom(), 0);
 
 			await tick();
+
+			// Process any queued requests if the chat is idle
+			const lastMessage = history.currentId ? history.messages[history.currentId] : null;
+			const isIdle = !lastMessage || lastMessage.role !== 'assistant' || lastMessage.done;
+			if (isIdle) {
+				await processNextInQueue(chatIdProp);
+			}
 
 			if (storageChatInput) {
 				try {
@@ -249,12 +269,13 @@
 
 	const onSelectedModelIdsChange = () => {
 		resetInput();
-		oldSelectedModelIds = JSON.parse(JSON.stringify(selectedModelIds));
+		oldSelectedModelIds = structuredClone(selectedModelIds);
 	};
 
 	const resetInput = () => {
 		selectedToolIds = [];
 		selectedFilterIds = [];
+		pendingOAuthTools = [];
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
 		codeInterpreterEnabled = false;
@@ -279,11 +300,33 @@
 		if (model) {
 			// Set Default Tools
 			if (model?.info?.meta?.toolIds) {
-				selectedToolIds = [
+				const defaultIds = [
 					...new Set(
 						[...(model?.info?.meta?.toolIds ?? [])].filter((id) => $tools.find((t) => t.id === id))
 					)
 				];
+
+				// Separate unauthenticated OAuth tools
+				const unauthed = [];
+				const authed = [];
+				for (const id of defaultIds) {
+					const tool = $tools.find((t) => t.id === id);
+					if (tool && tool.authenticated === false) {
+						const parts = id.split(':');
+						const serverId = parts.at(-1) ?? id;
+						const authType =
+							parts.length > 1 ? (parts[0] === 'server' ? parts[1] : parts[0]) : null;
+						unauthed.push({ id, name: tool.name ?? id, serverId, authType });
+					} else {
+						authed.push(id);
+					}
+				}
+				selectedToolIds = authed;
+				pendingOAuthTools = unauthed;
+			} else if ($settings?.tools) {
+				selectedToolIds = $settings.tools;
+			} else {
+				selectedToolIds = selectedToolIds.filter((id) => !id.startsWith('direct_server:'));
 			}
 
 			// Set Default Filters (Toggleable only)
@@ -295,24 +338,34 @@
 
 			// Set Default Features
 			if (model?.info?.meta?.defaultFeatureIds) {
-				if (model.info?.meta?.capabilities?.['image_generation']) {
+				if (
+					model.info?.meta?.capabilities?.['image_generation'] &&
+					$config?.features?.enable_image_generation &&
+					($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
+				) {
 					imageGenerationEnabled = model.info.meta.defaultFeatureIds.includes('image_generation');
 				}
 
-				if (model.info?.meta?.capabilities?.['web_search']) {
+				if (
+					model.info?.meta?.capabilities?.['web_search'] &&
+					$config?.features?.enable_web_search &&
+					($user?.role === 'admin' || $user?.permissions?.features?.web_search)
+				) {
 					webSearchEnabled = model.info.meta.defaultFeatureIds.includes('web_search');
 				}
 
-				if (model.info?.meta?.capabilities?.['code_interpreter']) {
+				if (
+					model.info?.meta?.capabilities?.['code_interpreter'] &&
+					$config?.features?.enable_code_interpreter &&
+					($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
+				) {
 					codeInterpreterEnabled = model.info.meta.defaultFeatureIds.includes('code_interpreter');
 				}
 			}
 		}
 	};
 
-	const showMessage = async (message, ignoreSettings = false) => {
-		await tick();
-
+	const showMessage = async (message, scroll = true) => {
 		const _chatId = JSON.parse(JSON.stringify($chatId));
 		let _messageId = JSON.parse(JSON.stringify(message.id));
 
@@ -333,18 +386,31 @@
 		history.currentId = _messageId;
 
 		await tick();
-		await tick();
-		await tick();
 
-		if (($settings?.scrollOnBranchChange ?? true) || ignoreSettings) {
+		if (($settings?.scrollOnBranchChange ?? true) && scroll) {
 			const messageElement = document.getElementById(`message-${message.id}`);
 			if (messageElement) {
-				messageElement.scrollIntoView({ behavior: 'smooth' });
+				messageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
 			}
 		}
 
 		await tick();
+		await tick();
+		await tick();
+
 		saveChatHandler(_chatId, history);
+	};
+
+	const terminalEventHandler = (type: string, data: any) => {
+		if (type === 'terminal:display_file') {
+			if (!data?.path) return;
+			displayFileHandler(data.path, { showControls, showFileNavPath });
+		} else if (type === 'terminal:write_file' || type === 'terminal:replace_file_content') {
+			if (!data?.path) return;
+			showFileNavDir.set(data.path);
+		} else if (type === 'terminal:run_command') {
+			showFileNavDir.set('/');
+		}
 	};
 
 	const chatEventHandler = async (event, cb) => {
@@ -367,11 +433,15 @@
 				} else if (type === 'chat:completion') {
 					chatCompletionEventHandler(data, message, event.chat_id);
 				} else if (type === 'chat:tasks:cancel') {
-					taskIds = null;
-					const responseMessage = history.messages[history.currentId];
-					// Set all response messages to done
-					for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-						history.messages[messageId].done = true;
+					if (event.message_id === history.currentId) {
+						taskIds = null;
+						// Set all response messages to done
+						for (const messageId of history.messages[message.parentId].childrenIds) {
+							history.messages[messageId].done = true;
+						}
+						await processNextInQueue($chatId);
+					} else {
+						message.done = true;
 					}
 				} else if (type === 'chat:message:delta' || type === 'message') {
 					message.content += data.content;
@@ -381,6 +451,15 @@
 					message.files = data.files;
 				} else if (type === 'chat:message:embeds' || type === 'embeds') {
 					message.embeds = data.embeds;
+
+					// Auto-scroll to the embed once it's rendered in the DOM
+					await tick();
+					setTimeout(() => {
+						const embedEl = document.getElementById(`${event.message_id}-embeds-container`);
+						if (embedEl) {
+							embedEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+						}
+					}, 100);
 				} else if (type === 'chat:message:error') {
 					message.error = data.error;
 				} else if (type === 'chat:message:follow_ups') {
@@ -389,6 +468,9 @@
 					if (autoScroll) {
 						scrollToBottom('smooth');
 					}
+				} else if (type === 'chat:message:favorite') {
+					// Update message favorite status
+					message.favorite = data.favorite;
 				} else if (type === 'chat:title') {
 					chatTitle.set(data);
 					currentChatPage.set(1);
@@ -467,12 +549,18 @@
 					eventConfirmationMessage = data.message;
 					eventConfirmationInputPlaceholder = data.placeholder;
 					eventConfirmationInputValue = data?.value ?? '';
+					eventConfirmationInputType = data?.type ?? '';
+				} else if (type.startsWith('terminal:')) {
+					terminalEventHandler(type, data);
 				} else {
 					console.log('Unknown message type', data);
 				}
 
 				history.messages[event.message_id] = message;
 			}
+		} else {
+			// Non-active chat completion: queue stays in the global store.
+			// navigateHandler will process it when the user returns to that chat.
 		}
 	};
 
@@ -480,11 +568,20 @@
 		origin: string;
 		data: { type: string; text: string };
 	}) => {
-		if (event.origin !== window.origin) {
+		const isSameOrigin = event.origin === window.origin;
+		const type = event.data?.type;
+
+		// Prompt-related message types only submit text to the chat input —
+		// functionally equivalent to the user typing.  When same-origin is
+		// enabled they go through immediately.  When it is disabled (opaque
+		// origin) we show a confirmation dialog so the user stays in control.
+		const iframePromptTypes = ['input:prompt', 'input:prompt:submit', 'action:submit'];
+
+		if (!isSameOrigin && !iframePromptTypes.includes(type)) {
 			return;
 		}
 
-		if (event.data.type === 'action:submit') {
+		if (type === 'action:submit') {
 			console.debug(event.data.text);
 
 			if (prompt !== '') {
@@ -493,8 +590,7 @@
 			}
 		}
 
-		// Replace with your iframe's origin
-		if (event.data.type === 'input:prompt') {
+		if (type === 'input:prompt') {
 			console.debug(event.data.text);
 
 			const inputElement = document.getElementById('chat-input');
@@ -505,12 +601,26 @@
 			}
 		}
 
-		if (event.data.type === 'input:prompt:submit') {
+		if (type === 'input:prompt:submit') {
 			console.debug(event.data.text);
 
 			if (event.data.text !== '') {
-				await tick();
-				submitPrompt(event.data.text);
+				if (isSameOrigin) {
+					await tick();
+					submitPrompt(event.data.text);
+				} else {
+					// Cross-origin: ask user to confirm before submitting
+					eventConfirmationInput = false;
+					eventConfirmationTitle = $i18n.t('Confirm Prompt from Embed');
+					eventConfirmationMessage = event.data.text;
+					eventCallback = async (confirmed: boolean) => {
+						if (confirmed) {
+							await tick();
+							submitPrompt(event.data.text);
+						}
+					};
+					showEventConfirmation = true;
+				}
 			}
 		}
 	};
@@ -533,74 +643,57 @@
 		savedModelIds();
 	}
 
-	let pageSubscribe = null;
-	let showControlsSubscribe = null;
-	let selectedFolderSubscribe = null;
-
 	const stopAudio = () => {
 		try {
 			speechSynthesis.cancel();
-			$audioQueue.stop();
+			$audioQueue?.stop();
 		} catch {}
 	};
 
-	onMount(async () => {
+	onMount(() => {
 		loading = true;
 		console.log('mounted');
 		window.addEventListener('message', onMessageHandler);
 		$socket?.on('events', chatEventHandler);
 
-		audioQueue.set(new AudioQueue(document.getElementById('audioElement')));
+		$audioQueue?.destroy();
 
-		pageSubscribe = page.subscribe(async (p) => {
+		const audioQueueInstance = new AudioQueue(document.getElementById('audioElement'));
+		audioQueue.set(audioQueueInstance);
+
+		// Restore direct terminal enabled states based on persisted selectedTerminalId
+		if ($settings?.terminalServers?.length) {
+			settings.set({
+				...$settings,
+				terminalServers: ($settings.terminalServers ?? []).map((s) => ({
+					...s,
+					enabled: $selectedTerminalId !== null && s.url === $selectedTerminalId
+				}))
+			});
+		}
+
+		const pageSubscribe = page.subscribe(async (p) => {
 			if (p.url.pathname === '/') {
 				await tick();
 				initNewChat();
+
+				// Re-fetch banners on navigation to homepage so newly configured banners appear
+				try {
+					banners.set(await getBanners(localStorage.token).catch(() => []));
+				} catch (e) {
+					console.error('Failed to refresh banners:', e);
+				}
 			}
 
 			stopAudio();
 		});
 
-		const storageChatInput = sessionStorage.getItem(
-			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
-		);
-
-		if (!chatIdProp) {
-			loading = false;
+		const showControlsSubscribe = showControls.subscribe(async (value) => {
 			await tick();
-		}
-
-		if (storageChatInput) {
-			prompt = '';
-			messageInput?.setText('');
-
-			files = [];
-			selectedToolIds = [];
-			selectedFilterIds = [];
-			webSearchEnabled = false;
-			imageGenerationEnabled = false;
-			codeInterpreterEnabled = false;
-
-			try {
-				const input = JSON.parse(storageChatInput);
-
-				if (!$temporaryChatEnabled) {
-					messageInput?.setText(input.prompt);
-					files = input.files;
-					selectedToolIds = input.selectedToolIds;
-					selectedFilterIds = input.selectedFilterIds;
-					webSearchEnabled = input.webSearchEnabled;
-					imageGenerationEnabled = input.imageGenerationEnabled;
-					codeInterpreterEnabled = input.codeInterpreterEnabled;
-				}
-			} catch (e) {}
-		}
-
-		showControlsSubscribe = showControls.subscribe(async (value) => {
 			if (controlPane && !$mobile) {
 				try {
 					if (value) {
-						controlPaneComponent.openPane();
+						controlPaneComponent?.openPane();
 					} else {
 						controlPane.collapse();
 					}
@@ -611,13 +704,13 @@
 
 			if (!value) {
 				showCallOverlay.set(false);
-				showOverview.set(false);
 				showArtifacts.set(false);
 				showEmbeds.set(false);
 			}
 		});
 
-		selectedFolderSubscribe = selectedFolder.subscribe(async (folder) => {
+		const selectedFolderSubscribe = selectedFolder.subscribe(async (folder) => {
+			await tick();
 			if (
 				folder?.data?.model_ids &&
 				JSON.stringify(selectedModels) !== JSON.stringify(folder.data.model_ids)
@@ -628,22 +721,60 @@
 			}
 		});
 
-		const chatInput = document.getElementById('chat-input');
-		chatInput?.focus();
-	});
+		const storageChatInput = sessionStorage.getItem(
+			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
+		);
 
-	onDestroy(() => {
-		try {
-			pageSubscribe();
-			showControlsSubscribe();
-			selectedFolderSubscribe();
-			chatIdUnsubscriber?.();
-			window.removeEventListener('message', onMessageHandler);
-			$socket?.off('events', chatEventHandler);
-			$audioQueue?.destroy();
-		} catch (e) {
-			console.error(e);
-		}
+		const init = async () => {
+			if (!chatIdProp) {
+				loading = false;
+				await tick();
+			}
+
+			if (storageChatInput) {
+				prompt = '';
+				messageInput?.setText('');
+
+				files = [];
+				selectedToolIds = [];
+				selectedFilterIds = [];
+				webSearchEnabled = false;
+				imageGenerationEnabled = false;
+				codeInterpreterEnabled = false;
+
+				try {
+					const input = JSON.parse(storageChatInput);
+
+					if (!$temporaryChatEnabled) {
+						messageInput?.setText(input.prompt);
+						files = input.files;
+						selectedToolIds = input.selectedToolIds;
+						selectedFilterIds = input.selectedFilterIds;
+						webSearchEnabled = input.webSearchEnabled;
+						imageGenerationEnabled = input.imageGenerationEnabled;
+						codeInterpreterEnabled = input.codeInterpreterEnabled;
+					}
+				} catch (e) {}
+			}
+
+			const chatInput = document.getElementById('chat-input');
+			chatInput?.focus();
+		};
+		init();
+
+		return () => {
+			try {
+				pageSubscribe();
+				showControlsSubscribe();
+				selectedFolderSubscribe();
+				window.removeEventListener('message', onMessageHandler);
+				$socket?.off('events', chatEventHandler);
+				audioQueueInstance?.destroy();
+				audioQueue.set(null);
+			} catch (e) {
+				console.error(e);
+			}
+		};
 	});
 
 	// File upload functions
@@ -758,7 +889,7 @@
 			fileItem.id = uploadedFile.id;
 			fileItem.size = file.size;
 			fileItem.collection_name = uploadedFile?.meta?.collection_name;
-			fileItem.url = `${WEBUI_API_BASE_URL}/files/${uploadedFile.id}`;
+			fileItem.url = `${uploadedFile.id}`;
 
 			files = files;
 			toast.success($i18n.t('File uploaded successfully'));
@@ -773,92 +904,89 @@
 		}
 	};
 
-	const uploadWeb = async (url) => {
-		console.log(url);
-
-		const fileItem = {
-			type: 'text',
-			name: url,
-			collection_name: '',
-			status: 'uploading',
-			url: url,
-			error: ''
-		};
-
-		try {
-			files = [...files, fileItem];
-			const res = await processWeb(localStorage.token, '', url);
-
-			if (res) {
-				fileItem.status = 'uploaded';
-				fileItem.collection_name = res.collection_name;
-				fileItem.file = {
-					...res.file,
-					...fileItem.file
-				};
-
-				files = files;
-			}
-		} catch (e) {
-			// Remove the failed doc from the files array
-			files = files.filter((f) => f.name !== url);
-			toast.error(JSON.stringify(e));
+	const uploadWeb = async (urls) => {
+		if ($user?.role !== 'admin' && !($user?.permissions?.chat?.web_upload ?? true)) {
+			toast.error($i18n.t('You do not have permission to upload web content.'));
+			return;
 		}
-	};
 
-	const uploadYoutubeTranscription = async (url) => {
-		console.log(url);
+		if (!Array.isArray(urls)) {
+			urls = [urls];
+		}
 
-		const fileItem = {
+		// Create file items first
+		const fileItems = urls.map((url) => ({
 			type: 'text',
 			name: url,
 			collection_name: '',
 			status: 'uploading',
 			context: 'full',
-			url: url,
+			url,
 			error: ''
-		};
+		}));
 
-		try {
-			files = [...files, fileItem];
-			const res = await processYoutubeVideo(localStorage.token, url);
+		// Display all items at once
+		files = [...files, ...fileItems];
 
-			if (res) {
-				fileItem.status = 'uploaded';
-				fileItem.collection_name = res.collection_name;
-				fileItem.file = {
-					...res.file,
-					...fileItem.file
-				};
-				files = files;
+		for (const fileItem of fileItems) {
+			try {
+				const res = isYoutubeUrl(fileItem.url)
+					? await processYoutubeVideo(localStorage.token, fileItem.url)
+					: await processWeb(localStorage.token, '', fileItem.url);
+
+				if (res) {
+					fileItem.status = 'uploaded';
+					fileItem.collection_name = res.collection_name;
+					fileItem.file = {
+						...res.file,
+						...fileItem.file
+					};
+				}
+
+				files = [...files];
+			} catch (e) {
+				files = files.filter((f) => f.name !== url);
+				toast.error(`${e}`);
 			}
-		} catch (e) {
-			// Remove the failed doc from the files array
-			files = files.filter((f) => f.name !== url);
-			toast.error(`${e}`);
 		}
 	};
 
-	$: if (history) {
-		getContents();
-	} else {
-		artifactContents.set([]);
-	}
+	const onUpload = async (event) => {
+		const { type, data } = event;
+
+		if (type === 'google-drive') {
+			await uploadGoogleDriveFile(data);
+		} else if (type === 'web') {
+			await uploadWeb(data);
+		}
+	};
+
+	const onHistoryChange = (history) => {
+		if (history) {
+			clearTimeout(contentsRAF);
+			contentsRAF = setTimeout(() => {
+				getContents();
+				contentsRAF = null;
+			}, 0);
+		} else {
+			artifactContents.set([]);
+		}
+	};
+
+	$: onHistoryChange(history);
 
 	const getContents = () => {
 		const messages = history ? createMessagesList(history, history.currentId) : [];
 		let contents = [];
 		messages.forEach((message) => {
 			if (message?.role !== 'user' && message?.content) {
-				const {
-					codeBlocks: codeBlocks,
-					html: htmlContent,
-					css: cssContent,
-					js: jsContent
-				} = getCodeBlockContents(message.content);
+				const { codeBlocks: codeBlocks, htmlGroups: htmlGroups } = getCodeBlockContents(
+					message.content
+				);
 
-				if (htmlContent || cssContent || jsContent) {
-					const renderedContent = `
+				if (htmlGroups && htmlGroups.length > 0) {
+					htmlGroups.forEach((group) => {
+						const renderedContent = `
                         <!DOCTYPE html>
                         <html lang="en">
                         <head>
@@ -869,19 +997,20 @@
 									background-color: white; /* Ensure the iframe has a white background */
 								}
 
-								${cssContent}
+								${group.css}
 							</${''}style>
                         </head>
                         <body>
-                            ${htmlContent}
+                            ${group.html}
 
 							<${''}script>
-                            	${jsContent}
+                            	${group.js}
 							</${''}script>
                         </body>
                         </html>
                     `;
-					contents = [...contents, { type: 'iframe', content: renderedContent }];
+						contents = [...contents, { type: 'iframe', content: renderedContent }];
+					});
 				} else {
 					// Check for SVG content
 					for (const block of codeBlocks) {
@@ -915,9 +1044,15 @@
 			}
 		}
 
+		if ($user?.role !== 'admin' && !$user?.permissions?.chat?.temporary) {
+			await temporaryChatEnabled.set(false);
+		}
+
 		const availableModels = $models
 			.filter((m) => !(m?.info?.meta?.hidden ?? false))
 			.map((m) => m.id);
+
+		const defaultModels = $config?.default_models ? $config?.default_models.split(',') : [];
 
 		if ($page.url.searchParams.get('models') || $page.url.searchParams.get('model')) {
 			const urlModels = (
@@ -927,8 +1062,8 @@
 			)?.split(',');
 
 			if (urlModels.length === 1) {
-				const m = $models.find((m) => m.id === urlModels[0]);
-				if (!m) {
+				if (!$models.find((m) => m.id === urlModels[0])) {
+					// Model not found; open model selector and prefill
 					const modelSelectorButton = document.getElementById('model-selector-0-button');
 					if (modelSelectorButton) {
 						modelSelectorButton.click();
@@ -942,46 +1077,65 @@
 						}
 					}
 				} else {
+					// Model found; set it as selected
 					selectedModels = urlModels;
 				}
 			} else {
+				// Multiple models; set as selected
 				selectedModels = urlModels;
 			}
 
+			// Unavailable models filtering
 			selectedModels = selectedModels.filter((modelId) =>
 				$models.map((m) => m.id).includes(modelId)
 			);
 		} else {
 			if ($selectedFolder?.data?.model_ids) {
+				// Set from folder model IDs
 				selectedModels = $selectedFolder?.data?.model_ids;
 			} else {
 				if (sessionStorage.selectedModels) {
+					// Set from session storage (temporary selection)
 					selectedModels = JSON.parse(sessionStorage.selectedModels);
 					sessionStorage.removeItem('selectedModels');
 				} else {
 					if ($settings?.models) {
+						// Set from user settings
 						selectedModels = $settings?.models;
-					} else if ($config?.default_models) {
-						console.log($config?.default_models.split(',') ?? '');
-						selectedModels = $config?.default_models.split(',');
+					} else if (defaultModels && defaultModels.length > 0) {
+						// Set from default models
+						selectedModels = defaultModels;
 					}
 				}
 			}
 
+			// Unavailable & hidden models filtering
 			selectedModels = selectedModels.filter((modelId) => availableModels.includes(modelId));
 		}
 
+		// Ensure at least one model is selected
 		if (selectedModels.length === 0 || (selectedModels.length === 1 && selectedModels[0] === '')) {
 			if (availableModels.length > 0) {
-				selectedModels = [availableModels?.at(0) ?? ''];
+				if (defaultModels && defaultModels.length > 0) {
+					selectedModels = defaultModels.filter((modelId) => availableModels.includes(modelId));
+				}
+
+				if (
+					selectedModels.length === 0 ||
+					(selectedModels.length === 1 && selectedModels[0] === '')
+				) {
+					// Only fall back to first available model if default models didn't resolve
+					selectedModels = [availableModels?.at(0) ?? ''];
+				}
 			} else {
 				selectedModels = [''];
 			}
 		}
 
-		await showControls.set(false);
+		if ($mobile) {
+			await showControls.set(false);
+		}
 		await showCallOverlay.set(false);
-		await showOverview.set(false);
 		await showArtifacts.set(false);
 
 		if ($page.url.pathname.includes('/c/')) {
@@ -1001,11 +1155,10 @@
 
 		chatFiles = [];
 		params = {};
+		taskIds = null;
 
 		if ($page.url.searchParams.get('youtube')) {
-			uploadYoutubeTranscription(
-				`https://www.youtube.com/watch?v=${$page.url.searchParams.get('youtube')}`
-			);
+			await uploadWeb(`https://www.youtube.com/watch?v=${$page.url.searchParams.get('youtube')}`);
 		}
 
 		if ($page.url.searchParams.get('load-url')) {
@@ -1036,6 +1189,15 @@
 				?.split(',')
 				.map((id) => id.trim())
 				.filter((id) => id);
+		}
+
+		// Restore tool selection after OAuth redirect
+		const pendingToolId = sessionStorage.getItem('pendingOAuthToolId');
+		if (pendingToolId) {
+			sessionStorage.removeItem('pendingOAuthToolId');
+			if (!selectedToolIds.includes(pendingToolId)) {
+				selectedToolIds = [...selectedToolIds, pendingToolId];
+			}
 		}
 
 		if ($page.url.searchParams.get('call') === 'true') {
@@ -1094,7 +1256,7 @@
 					selectedModels = selectedModels.length > 0 ? [selectedModels[0]] : [''];
 				}
 
-				oldSelectedModelIds = JSON.parse(JSON.stringify(selectedModels));
+				oldSelectedModelIds = structuredClone(selectedModels);
 
 				history =
 					(chatContent?.history ?? undefined) !== undefined
@@ -1111,7 +1273,7 @@
 
 				if (history.currentId) {
 					for (const message of Object.values(history.messages)) {
-						if (message.role === 'assistant') {
+						if (message && message.role === 'assistant' && message.done !== false) {
 							message.done = true;
 						}
 					}
@@ -1143,6 +1305,35 @@
 			});
 		}
 	};
+
+	let scrollRAF = null;
+	let contentsRAF = null;
+	const scheduleScrollToBottom = () => {
+		if (!scrollRAF) {
+			scrollRAF = requestAnimationFrame(async () => {
+				scrollRAF = null;
+				await scrollToBottom();
+			});
+		}
+	};
+
+	const processNextInQueue = async (targetChatId: string) => {
+		const queue = $chatRequestQueues[targetChatId];
+		if (!queue || queue.length === 0) return;
+
+		const combinedPrompt = queue.map((m) => m.prompt).join('\n\n');
+		const combinedFiles = queue.flatMap((m) => m.files);
+
+		chatRequestQueues.update((q) => {
+			const { [targetChatId]: _, ...rest } = q;
+			return rest;
+		});
+
+		files = combinedFiles;
+		await tick();
+		await submitPrompt(combinedPrompt);
+	};
+
 	const chatCompletedHandler = async (_chatId, modelId, responseMessageId, messages) => {
 		const res = await chatCompleted(localStorage.token, {
 			model: modelId,
@@ -1274,6 +1465,11 @@
 			const modelId = selectedModels[0];
 			const model = $models.filter((m) => m.id === modelId).at(0);
 
+			if (!model) {
+				toast.error($i18n.t('Model not found'));
+				return;
+			}
+
 			const messages = createMessagesList(history, history.currentId);
 			const parentMessage = messages.length !== 0 ? messages.at(-1) : null;
 
@@ -1390,7 +1586,12 @@
 	};
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
-		const { id, done, choices, content, sources, selected_model_id, error, usage } = data;
+		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+
+		// Store raw OR-aligned output items from backend
+		if (output) {
+			message.output = output;
+		}
 
 		if (error) {
 			await handleOpenAIError(error, message);
@@ -1416,27 +1617,29 @@
 						navigator.vibrate(5);
 					}
 
-					// Emit chat event for TTS
-					const messageContentParts = getMessageContentParts(
-						removeAllDetails(message.content),
-						$config?.audio?.tts?.split_on ?? 'punctuation'
-					);
-					messageContentParts.pop();
-
-					// dispatch only last sentence and make sure it hasn't been dispatched before
-					if (
-						messageContentParts.length > 0 &&
-						messageContentParts[messageContentParts.length - 1] !== message.lastSentence
-					) {
-						message.lastSentence = messageContentParts[messageContentParts.length - 1];
-						eventTarget.dispatchEvent(
-							new CustomEvent('chat', {
-								detail: {
-									id: message.id,
-									content: messageContentParts[messageContentParts.length - 1]
-								}
-							})
+					// Emit chat event for TTS (only when call overlay is active)
+					if ($showCallOverlay) {
+						const messageContentParts = getMessageContentParts(
+							removeAllDetails(message.content),
+							$config?.audio?.tts?.split_on ?? 'punctuation'
 						);
+						messageContentParts.pop();
+
+						// dispatch only last sentence and make sure it hasn't been dispatched before
+						if (
+							messageContentParts.length > 0 &&
+							messageContentParts[messageContentParts.length - 1] !== message.lastSentence
+						) {
+							message.lastSentence = messageContentParts[messageContentParts.length - 1];
+							eventTarget.dispatchEvent(
+								new CustomEvent('chat', {
+									detail: {
+										id: message.id,
+										content: messageContentParts[messageContentParts.length - 1]
+									}
+								})
+							);
+						}
 					}
 				}
 			}
@@ -1450,27 +1653,29 @@
 				navigator.vibrate(5);
 			}
 
-			// Emit chat event for TTS
-			const messageContentParts = getMessageContentParts(
-				removeAllDetails(message.content),
-				$config?.audio?.tts?.split_on ?? 'punctuation'
-			);
-			messageContentParts.pop();
-
-			// dispatch only last sentence and make sure it hasn't been dispatched before
-			if (
-				messageContentParts.length > 0 &&
-				messageContentParts[messageContentParts.length - 1] !== message.lastSentence
-			) {
-				message.lastSentence = messageContentParts[messageContentParts.length - 1];
-				eventTarget.dispatchEvent(
-					new CustomEvent('chat', {
-						detail: {
-							id: message.id,
-							content: messageContentParts[messageContentParts.length - 1]
-						}
-					})
+			// Emit chat event for TTS (only when call overlay is active)
+			if ($showCallOverlay) {
+				const messageContentParts = getMessageContentParts(
+					removeAllDetails(message.content),
+					$config?.audio?.tts?.split_on ?? 'punctuation'
 				);
+				messageContentParts.pop();
+
+				// dispatch only last sentence and make sure it hasn't been dispatched before
+				if (
+					messageContentParts.length > 0 &&
+					messageContentParts[messageContentParts.length - 1] !== message.lastSentence
+				) {
+					message.lastSentence = messageContentParts[messageContentParts.length - 1];
+					eventTarget.dispatchEvent(
+						new CustomEvent('chat', {
+							detail: {
+								id: message.id,
+								content: messageContentParts[messageContentParts.length - 1]
+							}
+						})
+					);
+				}
 			}
 		}
 
@@ -1497,18 +1702,20 @@
 				document.getElementById(`speak-button-${message.id}`)?.click();
 			}
 
-			// Emit chat event for TTS
-			let lastMessageContentPart =
-				getMessageContentParts(
-					removeAllDetails(message.content),
-					$config?.audio?.tts?.split_on ?? 'punctuation'
-				)?.at(-1) ?? '';
-			if (lastMessageContentPart) {
-				eventTarget.dispatchEvent(
-					new CustomEvent('chat', {
-						detail: { id: message.id, content: lastMessageContentPart }
-					})
-				);
+			// Emit chat event for TTS (only when call overlay is active)
+			if ($showCallOverlay) {
+				let lastMessageContentPart =
+					getMessageContentParts(
+						removeAllDetails(message.content),
+						$config?.audio?.tts?.split_on ?? 'punctuation'
+					)?.at(-1) ?? '';
+				if (lastMessageContentPart) {
+					eventTarget.dispatchEvent(
+						new CustomEvent('chat', {
+							detail: { id: message.id, content: lastMessageContentPart }
+						})
+					);
+				}
 			}
 			eventTarget.dispatchEvent(
 				new CustomEvent('chat:finish', {
@@ -1526,19 +1733,25 @@
 				scrollToBottom();
 			}
 
-			await chatCompletedHandler(
+			// Fire-and-forget: run chatCompletedHandler for background work
+			// (outlet filters, chat save, title gen, follow-ups, tags)
+			// without blocking the user from sending new messages.
+			chatCompletedHandler(
 				chatId,
 				message.model,
 				message.id,
 				createMessagesList(history, message.id)
 			);
+
+			// Process next queued request if any
+			await processNextInQueue(chatId);
 		}
 
 		console.log(data);
 		await tick();
 
 		if (autoScroll) {
-			scrollToBottom();
+			scheduleScrollToBottom();
 		}
 	};
 
@@ -1557,6 +1770,10 @@
 			selectedModels = _selectedModels;
 		}
 
+		if (pendingOAuthTools.length > 0) {
+			toast.warning($i18n.t('Please connect all required integrations before sending a message'));
+			return;
+		}
 		if (userPrompt === '' && files.length === 0) {
 			toast.error($i18n.t('Please enter a prompt'));
 			return;
@@ -1588,14 +1805,35 @@
 			return;
 		}
 
-		if (history?.currentId) {
-			const lastMessage = history.messages[history.currentId];
-			if (lastMessage.done != true) {
-				// Response not done
-				return;
-			}
+		// Check if the assistant is still generating the main response
+		// (don't block on background tasks like title gen, follow-ups, tags)
+		const lastMessage = history.currentId ? history.messages[history.currentId] : null;
+		const isGenerating = lastMessage && lastMessage.role === 'assistant' && !lastMessage.done;
 
-			if (lastMessage.error && !lastMessage.content) {
+		if (isGenerating) {
+			if ($settings?.enableMessageQueue ?? true) {
+				// Enqueue the request
+				const _files = structuredClone(files);
+				chatRequestQueues.update((q) => ({
+					...q,
+					[$chatId]: [...(q[$chatId] ?? []), { id: uuidv4(), prompt: userPrompt, files: _files }]
+				}));
+				// Clear input
+				messageInput?.setText('');
+				prompt = '';
+				files = [];
+				return;
+			} else {
+				// Interrupt: stop current generation and proceed
+				await stopResponse();
+				await tick();
+			}
+		}
+
+		if (history?.currentId) {
+			const currentMessage = history.messages[history.currentId];
+
+			if (currentMessage.error && !currentMessage.content) {
 				// Error in response
 				toast.error($i18n.t(`Oops! There was an error in the previous response.`));
 				return;
@@ -1606,11 +1844,13 @@
 		prompt = '';
 
 		const messages = createMessagesList(history, history.currentId);
-		const _files = JSON.parse(JSON.stringify(files));
+		const _files = structuredClone(files);
 
 		chatFiles.push(
-			..._files.filter((item) =>
-				['doc', 'text', 'file', 'note', 'chat', 'folder', 'collection'].includes(item.type)
+			..._files.filter(
+				(item) =>
+					['doc', 'text', 'note', 'chat', 'folder', 'collection'].includes(item.type) ||
+					(item.type === 'file' && !(item?.content_type ?? '').startsWith('image/'))
 			)
 		);
 		chatFiles = chatFiles.filter(
@@ -1673,7 +1913,7 @@
 		}
 
 		let _chatId = JSON.parse(JSON.stringify($chatId));
-		_history = JSON.parse(JSON.stringify(_history));
+		_history = structuredClone(_history);
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
 		// If modelId is provided, use it, else use selected model
@@ -1726,7 +1966,7 @@
 
 		await tick();
 
-		_history = JSON.parse(JSON.stringify(history));
+		_history = structuredClone(history);
 		// Save chat after all messages have been created
 		await saveChatHandler(_chatId, _history);
 
@@ -1737,11 +1977,18 @@
 
 				if (model) {
 					// If there are image files, check if model is vision capable
+					// Skip this check if image generation is enabled, as images may be for editing or are generated outputs in the history
 					const hasImages = createMessagesList(_history, parentId).some((message) =>
-						message.files?.some((file) => file.type === 'image')
+						message.files?.some(
+							(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
+						)
 					);
 
-					if (hasImages && !(model.info?.meta?.capabilities?.vision ?? true)) {
+					if (
+						hasImages &&
+						!(model.info?.meta?.capabilities?.vision ?? true) &&
+						!imageGenerationEnabled
+					) {
 						toast.error(
 							$i18n.t('Model {{modelName}} is not vision capable', {
 								modelName: model.name ?? model.id
@@ -1770,9 +2017,6 @@
 				}
 			})
 		);
-
-		currentChatPage.set(1);
-		chats.set(await getChatList(localStorage.token, $currentChatPage));
 	};
 
 	const getFeatures = () => {
@@ -1816,6 +2060,17 @@
 		return features;
 	};
 
+	const getStopTokens = () => {
+		const stop = params?.stop ?? $settings?.params?.stop;
+		if (!stop) return undefined;
+
+		const tokens = Array.isArray(stop) ? stop : stop.split(',').map((s) => s.trim());
+
+		return tokens
+			.filter(Boolean)
+			.map((token) => decodeURIComponent(JSON.parse(`"${token.replace(/"/g, '\\"')}"`)));
+	};
+
 	const sendMessageSocket = async (model, _messages, _history, responseMessageId, _chatId) => {
 		const responseMessage = _history.messages[responseMessageId];
 		const userMessage = _history.messages[responseMessage.parentId];
@@ -1830,10 +2085,12 @@
 			return fileExists;
 		});
 
-		let files = JSON.parse(JSON.stringify(chatFiles));
+		let files = structuredClone(chatFiles);
 		files.push(
-			...(userMessage?.files ?? []).filter((item) =>
-				['doc', 'text', 'file', 'note', 'chat', 'collection'].includes(item.type)
+			...(userMessage?.files ?? []).filter(
+				(item) =>
+					['doc', 'text', 'note', 'chat', 'collection'].includes(item.type) ||
+					(item.type === 'file' && !(item?.content_type ?? '').startsWith('image/'))
 			)
 		);
 		// Remove duplicates
@@ -1875,35 +2132,42 @@
 				: undefined,
 			..._messages.map((message) => ({
 				...message,
-				content: processDetails(message.content)
+				content: processDetails(message.content),
+				// Include output for temp chats (backend will use it and strip before LLM)
+				...(message.output ? { output: message.output } : {})
 			}))
 		].filter((message) => message);
 
 		messages = messages
-			.map((message, idx, arr) => ({
-				role: message.role,
-				...((message.files?.filter((file) => file.type === 'image').length > 0 ?? false) &&
-				message.role === 'user'
-					? {
-							content: [
-								{
-									type: 'text',
-									text: message?.merged?.content ?? message.content
-								},
-								...message.files
-									.filter((file) => file.type === 'image')
-									.map((file) => ({
+			.map((message, idx, arr) => {
+				const imageFiles = (message?.files ?? []).filter(
+					(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
+				);
+
+				return {
+					role: message.role,
+					// Preserve output items so backend can reconstruct tool_calls/tool-role messages (temp chats)
+					...(message.output ? { output: message.output } : {}),
+					...(message.role === 'user' && imageFiles.length > 0
+						? {
+								content: [
+									{
+										type: 'text',
+										text: message?.merged?.content ?? message.content
+									},
+									...imageFiles.map((file) => ({
 										type: 'image_url',
 										image_url: {
 											url: file.url
 										}
 									}))
-							]
-						}
-					: {
-							content: message?.merged?.content ?? message.content
-						})
-			}))
+								]
+							}
+						: {
+								content: message?.merged?.content ?? message.content
+							})
+				};
+			})
 			.filter((message) => message?.role === 'user' || message?.content?.trim());
 
 		const toolIds = [];
@@ -1923,6 +2187,44 @@
 			}
 		}
 
+		// Parse skill mentions (<$skillId|label>) from user messages
+		const skillMentionRegex = /<\$([^|>]+)\|?[^>]*>/g;
+		const skillIds = [];
+		for (const message of messages) {
+			const content =
+				typeof message.content === 'string' ? message.content : (message.content?.[0]?.text ?? '');
+			for (const match of content.matchAll(skillMentionRegex)) {
+				if (!skillIds.includes(match[1])) {
+					skillIds.push(match[1]);
+				}
+			}
+		}
+
+		// Strip skill mentions from message content
+		if (skillIds.length > 0) {
+			messages = messages.map((message) => {
+				if (typeof message.content === 'string') {
+					return {
+						...message,
+						content: message.content.replace(/<\$[^>]+>/g, '').trim()
+					};
+				} else if (Array.isArray(message.content)) {
+					return {
+						...message,
+						content: message.content.map((part) =>
+							part.type === 'text'
+								? { ...part, text: part.text.replace(/<\$[^>]+>/g, '').trim() }
+								: part
+						)
+					};
+				}
+				return message;
+			});
+		}
+
+		// Use the user-selected terminal from the dropdown
+		const activeTerminalId = $selectedTerminalId ?? null;
+
 		const res = await generateOpenAIChatCompletion(
 			localStorage.token,
 			{
@@ -1932,30 +2234,39 @@
 				params: {
 					...$settings?.params,
 					...params,
-					stop:
-						(params?.stop ?? $settings?.params?.stop ?? undefined)
-							? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
-									(str) => decodeURIComponent(JSON.parse('"' + str.replace(/\"/g, '\\"') + '"'))
-								)
-							: undefined
+					stop: getStopTokens()
 				},
 
 				files: (files?.length ?? 0) > 0 ? files : undefined,
 
 				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
 				tool_ids: toolIds.length > 0 ? toolIds : undefined,
-				tool_servers: ($toolServers ?? []).filter(
-					(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
-				),
+				skill_ids: skillIds.length > 0 ? skillIds : undefined,
+				terminal_id: activeTerminalId ?? undefined,
+				tool_servers: [
+					...($toolServers ?? []).filter(
+						(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
+					),
+					// Direct terminal servers — always included when enabled (not routed through selectedToolIds)
+					...($terminalServers ?? []).filter((t) => !t.id)
+				],
 				features: getFeatures(),
 				variables: {
-					...getPromptVariables($user?.name, $settings?.userLocation ? userLocation : undefined)
+					...getPromptVariables(
+						$user?.name,
+						$settings?.userLocation ? userLocation : undefined,
+						$user?.email
+					)
 				},
 				model_item: $models.find((m) => m.id === model.id),
 
 				session_id: $socket?.id,
 				chat_id: $chatId,
+				folder_id: $selectedFolder?.id ?? undefined,
+
 				id: responseMessageId,
+				parent_id: userMessage?.id ?? null,
+				parent_message: userMessage,
 
 				background_tasks: {
 					...(!$temporaryChatEnabled &&
@@ -2079,8 +2390,10 @@
 
 			const responseMessage = history.messages[history.currentId];
 			// Set all response messages to done
-			for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-				history.messages[messageId].done = true;
+			if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
+				for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
+					history.messages[messageId].done = true;
+				}
 			}
 
 			history.messages[history.currentId] = responseMessage;
@@ -2095,6 +2408,8 @@
 			generationController?.abort();
 			generationController = null;
 		}
+
+		await processNextInQueue($chatId);
 	};
 
 	const submitMessage = async (parentId, prompt) => {
@@ -2135,6 +2450,11 @@
 
 		if (history.currentId) {
 			let userMessage = history.messages[message.parentId];
+
+			if (!userMessage) {
+				toast.error($i18n.t('Parent message not found'));
+				return;
+			}
 
 			if (autoScroll) {
 				scrollToBottom();
@@ -2202,14 +2522,17 @@
 			generating = true;
 			const [res, controller] = await generateMoACompletion(
 				localStorage.token,
-				message.model,
-				history.messages[message.parentId].content,
+				message.model ?? '',
+				message.parentId ? history.messages[message.parentId].content : '',
 				responses
 			);
 
 			if (res && res.ok && res.body && generating) {
-				generationController = controller;
-				const textStream = await createOpenAITextStream(res.body, $settings.splitLargeChunks);
+				generationController = controller as AbortController;
+				const textStream = await createOpenAITextStream(
+					res.body,
+					Boolean($settings?.splitLargeChunks ?? false)
+				);
 				for await (const update of textStream) {
 					const { value, done, sources, error, usage } = update;
 					if (error || done) {
@@ -2226,7 +2549,7 @@
 					}
 
 					if (autoScroll) {
-						scrollToBottom();
+						scheduleScrollToBottom();
 					}
 				}
 
@@ -2289,14 +2612,12 @@
 					params: params,
 					files: chatFiles
 				});
-				currentChatPage.set(1);
-				await chats.set(await getChatList(localStorage.token, $currentChatPage));
 			}
 		}
 	};
 
 	const MAX_DRAFT_LENGTH = 5000;
-	let saveDraftTimeout = null;
+	let saveDraftTimeout: ReturnType<typeof setTimeout> | null = null;
 
 	const saveDraft = async (draft, chatId = null) => {
 		if (saveDraftTimeout) {
@@ -2342,6 +2663,21 @@
 			toast.error($i18n.t('Failed to move chat'));
 		}
 	};
+
+	const archiveChatHandler = async (id: string) => {
+		try {
+			await archiveChatById(localStorage.token, id);
+			currentChatPage.set(1);
+			initNewChat();
+			await goto('/');
+			chats.set(await getChatList(localStorage.token, $currentChatPage));
+			pinnedChats.set(await getPinnedChatList(localStorage.token));
+			toast.success($i18n.t('Chat archived.'));
+		} catch (error) {
+			console.error('Error archiving chat:', error);
+			toast.error($i18n.t('Failed to archive chat.'));
+		}
+	};
 </script>
 
 <svelte:head>
@@ -2363,6 +2699,7 @@
 	input={eventConfirmationInput}
 	inputPlaceholder={eventConfirmationInputPlaceholder}
 	inputValue={eventConfirmationInputValue}
+	inputType={eventConfirmationInputType}
 	on:confirm={(e) => {
 		if (e.detail) {
 			eventCallback(e.detail);
@@ -2377,7 +2714,7 @@
 
 <div
 	class="h-screen max-h-[100dvh] transition-width duration-200 ease-in-out {$showSidebar
-		? '  md:max-w-[calc(100%-260px)]'
+		? '  md:max-w-[calc(100%-var(--sidebar-width))]'
 		: ' '} w-full max-w-full flex flex-col"
 	id="chat-container"
 >
@@ -2406,6 +2743,7 @@
 
 			<PaneGroup direction="horizontal" class="w-full h-full">
 				<Pane defaultSize={50} minSize={30} class="h-full flex relative max-w-full flex-col">
+					<FilesOverlay show={dragged} />
 					<Navbar
 						bind:this={navbarElement}
 						chat={{
@@ -2424,7 +2762,7 @@
 						bind:selectedModels
 						shareEnabled={!!history.currentId}
 						{initNewChat}
-						archiveChatHandler={() => {}}
+						{archiveChatHandler}
 						{moveChatHandler}
 						onSaveTempChat={async () => {
 							try {
@@ -2442,6 +2780,7 @@
 										id: uuidv4(),
 										title: title.length > 50 ? `${title.slice(0, 50)}...` : title,
 										models: selectedModels,
+										params: params,
 										history: history,
 										messages: messages,
 										timestamp: Date.now()
@@ -2464,7 +2803,7 @@
 						}}
 					/>
 
-					<div class="flex flex-col flex-auto z-10 w-full @container overflow-auto">
+					<div id="chat-pane" class="flex flex-col flex-auto z-10 w-full @container overflow-auto">
 						{#if ($settings?.landingPageMode === 'chat' && !$selectedFolder) || createMessagesList(history, history.currentId).length > 0}
 							<div
 								class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden"
@@ -2502,7 +2841,7 @@
 								</div>
 							</div>
 
-							<div class=" pb-2 z-10">
+							<div class=" pb-2 {dragged ? 'z-0' : 'z-10'}">
 								<MessageInput
 									bind:this={messageInput}
 									{history}
@@ -2515,27 +2854,59 @@
 									bind:selectedFilterIds
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
+									{pendingOAuthTools}
 									bind:webSearchEnabled
 									bind:atSelectedModel
 									bind:showCommands
+									bind:dragged
 									toolServers={$toolServers}
 									{generating}
 									{stopResponse}
 									{createMessagePair}
+									{onUpload}
+									messageQueue={$chatRequestQueues[$chatId] ?? []}
+									onQueueSendNow={async (id) => {
+										const queue = $chatRequestQueues[$chatId] ?? [];
+										const item = queue.find((m) => m.id === id);
+										if (item) {
+											// Remove from queue
+											chatRequestQueues.update((q) => ({
+												...q,
+												[$chatId]: queue.filter((m) => m.id !== id)
+											}));
+											// Stop current generation first
+											await stopResponse();
+											await tick();
+											// Set files and submit
+											files = item.files;
+											await tick();
+											await submitPrompt(item.prompt);
+										}
+									}}
+									onQueueEdit={(id) => {
+										const queue = $chatRequestQueues[$chatId] ?? [];
+										const item = queue.find((m) => m.id === id);
+										if (item) {
+											// Remove from queue
+											chatRequestQueues.update((q) => ({
+												...q,
+												[$chatId]: queue.filter((m) => m.id !== id)
+											}));
+											// Set files and restore prompt to input
+											files = item.files;
+											messageInput?.setText(item.prompt);
+										}
+									}}
+									onQueueDelete={(id) => {
+										const queue = $chatRequestQueues[$chatId] ?? [];
+										chatRequestQueues.update((q) => ({
+											...q,
+											[$chatId]: queue.filter((m) => m.id !== id)
+										}));
+									}}
 									onChange={(data) => {
 										if (!$temporaryChatEnabled) {
 											saveDraft(data, $chatId);
-										}
-									}}
-									on:upload={async (e) => {
-										const { type, data } = e.detail;
-
-										if (type === 'web') {
-											await uploadWeb(data);
-										} else if (type === 'youtube') {
-											await uploadYoutubeTranscription(data);
-										} else if (type === 'google-drive') {
-											await uploadGoogleDriveFile(data);
 										}
 									}}
 									on:submit={async (e) => {
@@ -2570,22 +2941,16 @@
 									bind:webSearchEnabled
 									bind:atSelectedModel
 									bind:showCommands
+									bind:dragged
+									{pendingOAuthTools}
 									toolServers={$toolServers}
 									{stopResponse}
 									{createMessagePair}
 									{onSelect}
+									{onUpload}
 									onChange={(data) => {
 										if (!$temporaryChatEnabled) {
 											saveDraft(data);
-										}
-									}}
-									on:upload={async (e) => {
-										const { type, data } = e.detail;
-
-										if (type === 'web') {
-											await uploadWeb(data);
-										} else if (type === 'youtube') {
-											await uploadYoutubeTranscription(data);
 										}
 									}}
 									on:submit={async (e) => {
@@ -2621,6 +2986,7 @@
 					{stopResponse}
 					{showMessage}
 					{eventTarget}
+					{codeInterpreterEnabled}
 				/>
 			</PaneGroup>
 		</div>

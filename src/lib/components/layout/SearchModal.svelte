@@ -163,7 +163,9 @@
 		allChatsLoaded = newChatList.length === 0;
 
 		if (newChatList.length > 0) {
-			chatList = [...chatList, ...newChatList];
+			const existingIds = new Set(chatList.map((c) => c.id));
+			const uniqueNewChats = newChatList.filter((c) => !existingIds.has(c.id));
+			chatList = [...chatList, ...uniqueNewChats];
 		}
 
 		chatListLoading = false;
@@ -291,7 +293,7 @@
 			/>
 		</div>
 
-		<!-- <hr class="border-gray-50 dark:border-gray-850 my-1" /> -->
+		<!-- <hr class="border-gray-50 dark:border-gray-850/30 my-1" /> -->
 
 		<div class="flex px-4 pb-1">
 			<div
@@ -328,7 +330,7 @@
 				{/each}
 
 				{#if chatList}
-					<hr class="border-gray-50 dark:border-gray-850 my-3" />
+					<hr class="border-gray-50 dark:border-gray-850/30 my-3" />
 
 					{#if chatList.length === 0}
 						<div class="text-xs text-gray-500 dark:text-gray-400 text-center px-5 py-4">
@@ -425,7 +427,7 @@
 			</div>
 			<div
 				id="chat-preview"
-				class="hidden md:flex md:flex-1 w-full overflow-y-auto h-96 md:h-[40rem] scrollbar-hidden"
+				class="hidden md:flex md:flex-1 w-full overflow-y-auto h-96 md:h-[40rem] scrollbar-hidden @container"
 			>
 				{#if messages === null}
 					<div

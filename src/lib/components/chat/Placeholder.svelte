@@ -47,6 +47,7 @@
 
 	export let selectedToolIds = [];
 	export let selectedFilterIds = [];
+	export let pendingOAuthTools = [];
 
 	export let showCommands = false;
 
@@ -54,10 +55,13 @@
 	export let codeInterpreterEnabled = false;
 	export let webSearchEnabled = false;
 
+	export let onUpload: Function = (e) => {};
 	export let onSelect = (e) => {};
 	export let onChange = (e) => {};
 
 	export let toolServers = [];
+
+	export let dragged = false;
 
 	let models = [];
 	let selectedModelIdx = 0;
@@ -125,6 +129,9 @@
 											class=" size-9 @sm:size-10 rounded-full border-[1px] border-gray-100 dark:border-none"
 											aria-hidden="true"
 											draggable="false"
+											on:error={(e) => {
+												e.currentTarget.src = '/favicon.png';
+											}}
 										/>
 									</button>
 								</Tooltip>
@@ -211,14 +218,14 @@
 					bind:webSearchEnabled
 					bind:atSelectedModel
 					bind:showCommands
+					bind:dragged
+					{pendingOAuthTools}
 					{toolServers}
 					{stopResponse}
 					{createMessagePair}
 					placeholder={$i18n.t('How can I help you today?')}
 					{onChange}
-					on:upload={(e) => {
-						dispatch('upload', e.detail);
-					}}
+					{onUpload}
 					on:submit={(e) => {
 						dispatch('submit', e.detail);
 					}}
